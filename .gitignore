@@ -1,0 +1,10 @@
+# Recon output directories
+phantom_*/
+
+# Temp files
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
