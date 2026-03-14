@@ -36,7 +36,11 @@ TARGET=""
 OUTPUT_DIR=""
 WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
 MAX_DNS_QUERIES=200   # amass rate limiter
-
+# ─────────────────────────────────────────────────────────────────
+# TOOL PATHS
+# ─────────────────────────────────────────────────────────────────
+# The LinkFinder venv we just created
+LINKFINDER_BIN="$HOME/tools/LinkFinder/venv/bin/python $HOME/tools/LinkFinder/linkfinder.py"
 # ─────────────────────────────────────────────────────────────────
 # COLORS
 # ─────────────────────────────────────────────────────────────────
@@ -119,6 +123,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ─────────────────────────────────────────────────────────────────
+# NEW UTILITY: SUBDOMAIN CLEANER
+# ─────────────────────────────────────────────────────────────────
+clean_subs() {
+  local raw_file="$1"
+  local clean_file="$2"
+  
+  info "Cleaning and validating subdomains for $TARGET..."
+  
+  grep -oE '([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}' "$raw_file" | \
+    tr '[:upper:]' '[:lower:]' | \
+    grep -E "(\.|^)${TARGET}$" | \
+    grep -vE '(ns-[0-9]+\.awsdns|awsdns|_record|fqdn|-->|aka\.ms|amazonaws|azure)' | \
+    sort -u > "$clean_file"
+
+  success "Cleaning complete. Valid targets: $(wc -l < "$clean_file")"
+}
+# ─────────────────────────────────────────────────────────────────
 # TOOL CHECK HELPER
 # ─────────────────────────────────────────────────────────────────
 check_tool() {
@@ -145,7 +166,8 @@ validate() {
 
   # Core tools — always required
   check_tool subfinder
-  check_tool httpx
+  check_tool httpx-toolkit
+
 
   # Mode-specific tools
   case $MODE in
@@ -190,6 +212,9 @@ setup_output() {
 #   subfinder → -t (thread cap, passive sources only, safe)
 #   amass     → --passive + -max-dns-queries (hard cap on DNS queries per minute)
 # ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# MODULE 1 — PASSIVE SUBDOMAIN ENUMERATION
+# ─────────────────────────────────────────────────────────────────
 passive_subs() {
   section "PASSIVE SUBDOMAIN ENUMERATION"
   warn "No direct contact with target — passive sources only"
@@ -204,8 +229,7 @@ passive_subs() {
 
   sleep "$DELAY"
 
-  info "Running amass (passive — max-dns-queries: $MAX_DNS_QUERIES)..."
-  # FIX v2.0: added -max-dns-queries to rate limit DNS resolution
+  info "Running amass (passive)..."
   amass enum \
     --passive \
     -d "$TARGET" \
@@ -216,32 +240,37 @@ passive_subs() {
 
   sleep "$DELAY"
 
-  # Merge & deduplicate
-  cat "$OUTPUT_DIR/subdomains/subfinder.txt" \
-      "$OUTPUT_DIR/subdomains/amass.txt" 2>/dev/null | \
-    sort -u > "$OUTPUT_DIR/subdomains/all_subs.txt"
+  # --- THIS IS THE NEW PART ---
+  info "Merging and cleaning subdomain lists..."
+  cat "$OUTPUT_DIR/subdomains/subfinder.txt" "$OUTPUT_DIR/subdomains/amass.txt" 2>/dev/null > "$OUTPUT_DIR/subdomains/raw_combined.txt"
+
+  # Call your clean_subs function
+  clean_subs "$OUTPUT_DIR/subdomains/raw_combined.txt" "$OUTPUT_DIR/subdomains/all_subs.txt"
+  
+  # Remove the messy combined file
+  rm "$OUTPUT_DIR/subdomains/raw_combined.txt"
+  # ----------------------------
 
   success "Total unique subdomains: ${BOLD}$(wc -l < "$OUTPUT_DIR/subdomains/all_subs.txt")${RESET}"
 }
-
 # ─────────────────────────────────────────────────────────────────
 # MODULE 2 — PROBE ALIVE HOSTS
 # ─────────────────────────────────────────────────────────────────
 # Rate limiting:
-#   httpx → -rate-limit (native, requests/sec) + -threads (concurrency cap)
-#   Both enforced natively by httpx — not bash sleep
+#   httpx-toolkit → -rate-limit (native, requests/sec) + -threads (concurrency cap)
+#   Both enforced natively by httpx-toolkit — not bash sleep
 # ─────────────────────────────────────────────────────────────────
 probe_alive() {
   section "PROBING ALIVE HOSTS"
-  warn "Direct contact — rate limited: $RATE req/s / $THREADS threads (httpx native)"
+  warn "Direct contact — rate limited: $RATE req/s / $THREADS threads (httpx-toolkit native)"
 
   [[ ! -f "$OUTPUT_DIR/subdomains/all_subs.txt" ]] && {
     error "No subdomains file. Run passive mode first."
     return 1
   }
 
-  info "Probing with httpx..."
-  cat "$OUTPUT_DIR/subdomains/all_subs.txt" | httpx \
+  info "Probing with httpx-toolkit..."
+  cat "$OUTPUT_DIR/subdomains/all_subs.txt" | httpx-toolkit \
     -threads "$THREADS" \
     -rate-limit "$RATE" \
     -timeout 10 \
@@ -460,21 +489,9 @@ analyze_js() {
 # ─────────────────────────────────────────────────────────────────
 fuzz_targets() {
   section "DIRECTORY & PARAMETER FUZZING"
-  warn "Direct contact — ffuf native rate limit: $RATE req/s / $THREADS threads"
-  warn "Always verify program policy allows fuzzing before running this module"
+  warn "Stealth Mode: Using delays to avoid detection on $TARGET"
 
-  [[ ! -f "$WORDLIST" ]] && {
-    error "Wordlist not found: $WORDLIST"
-    error "Install: yay -S seclists"
-    return 1
-  }
-
-  [[ ! -f "$OUTPUT_DIR/subdomains/alive.txt" ]] && {
-    error "No alive hosts. Run active mode first."
-    return 1
-  }
-
-  info "Fuzzing alive hosts for hidden directories..."
+  # ... [Keep your wordlist and alive.txt checks] ...
 
   while IFS= read -r host; do
     [[ -z "$host" ]] && continue
@@ -482,21 +499,27 @@ fuzz_targets() {
     safe_name=$(echo "$domain" | sed 's/[:/]/_/g')
 
     info "Fuzzing: $domain"
-    ffuf \
-      -u "${domain}/FUZZ" \
+    
+    # -p 0.1-0.5: Adds a random delay between 100ms and 500ms (looks human)
+    # -rate 3: Hard limit of 3 requests per second
+    # -t 2: Low thread count to keep the connection "thin"
+    ffuf -u "${domain}/FUZZ" \
       -w "$WORDLIST" \
-      -t "$THREADS" \
-      -rate "$RATE" \
+      -t 2 \
+      -p "0.1-0.5" \
+      -rate 3 \
       -timeout 10 \
       -mc 200,201,204,301,302,401,403,405 \
       -fc 404 \
+      -ac \
       -o "$OUTPUT_DIR/fuzzing/${safe_name}.json" \
       -of json \
-      -s 2>/dev/null
+      -s
 
-    sleep "$DELAY"   # politeness buffer between hosts
-
+    # A longer "breather" between different subdomains
+    sleep 2
   done < "$OUTPUT_DIR/subdomains/alive.txt"
+
 
   success "Fuzzing complete — results in $OUTPUT_DIR/fuzzing/"
   warn "Focus on 401/403 results — potential bypass opportunities"
